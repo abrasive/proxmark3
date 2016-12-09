@@ -825,6 +825,113 @@ void rotateCSN(uint8_t* originalCSN, uint8_t* rotatedCSN) {
 	}
 }
 
+static int uart_synced = 0;
+static int uart_frame = 0;
+static int uart_frame_done = 0;
+static uint8_t *uart_buf;
+static int uart_len;
+
+static void uart_bit(uint8_t bit) {
+    static uint8_t buf = 0xff;
+    static uint8_t n_buf;
+    static uint8_t msg_byte;
+    static int nmsg_byte;
+    buf <<= 1;
+    buf |= bit ? 1 : 0;
+
+    if (!uart_frame) {
+        if (buf == 0x7b) {
+            uart_frame = 1;
+            n_buf = 0;
+            uart_len = 0;
+            nmsg_byte = 0;
+        }
+    } else {
+        n_buf++;
+        if (n_buf == 8) {
+            msg_byte >>= 2;
+            switch (buf) {
+                case 0xbf:    // 0
+                    break;
+                case 0xef:    // 1
+                    msg_byte |= (1<<6);
+                    break;
+                case 0xfb:    // 2
+                    msg_byte |= (2<<6);
+                    break;
+                case 0xfe:    // 3
+                    msg_byte |= (3<<6);
+                    break;
+                case 0xdf:    // eof
+                    uart_frame = 0;
+                    uart_synced = 0;
+                    uart_frame_done = 1;
+                    break;
+                default:
+                    uart_frame = uart_synced = 0;
+                    Dbprintf("bad %02X at %d:%d", buf, uart_len, nmsg_byte);
+            }
+
+            if (uart_frame) {   // data bits
+                nmsg_byte += 2;
+                if (nmsg_byte >= 8) {
+                    uart_buf[uart_len++] = msg_byte;
+                    nmsg_byte = 0;
+                }
+            }
+            n_buf = 0;
+            buf = 0xff;
+        }
+    }
+}
+
+static void uart_samples(uint8_t byte) {
+    static uint32_t buf;
+    static int window;
+    static int drop_next = 0;
+
+    uint32_t falling;
+    int lz;
+
+    if (!uart_synced) {
+        if (byte == 0xff)
+            return;
+        buf = 0xffffffff;
+        window = 0;
+        drop_next = 0;
+        uart_synced = 1;
+    }
+
+    buf <<= 8;
+    buf |= byte;
+
+    if (drop_next) {
+        drop_next = 0;
+        return;
+    }
+
+again:
+    falling = ~buf & ((buf >> 1) ^ buf) & (0xff << window);
+
+    uart_bit(!falling);
+
+    if (!falling)
+        return;
+
+    lz = __builtin_clz(falling) - 24 + window;
+
+    // aim to get falling edge on fourth-leftmost bit of window
+    window += 3 - lz;
+
+    if (window < 0) {
+        window += 8;
+        drop_next = 1;
+    } else if (window >= 8) {
+        window -= 8;
+        goto again;
+    }
+}
+
 //-----------------------------------------------------------------------------
 // Wait for commands from reader
 // Stop when button is pressed
@@ -838,10 +945,10 @@ static int GetIClassCommandFromReader(uint8_t *received, int *len, int maxLen)
     LED_D_OFF();
     FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_ISO14443A_TAGSIM_LISTEN);
 
-    // Now run a `software UART' on the stream of incoming samples.
-    Uart.output = received;
-    Uart.byteCntMax = maxLen;
-    Uart.state = STATE_UNSYNCD;
+    uart_frame_done = 0;
+    uart_synced = uart_frame = 0;
+    uart_buf = received;
+
 
     for(;;) {
         WDT_HIT();
@@ -853,11 +960,12 @@ static int GetIClassCommandFromReader(uint8_t *received, int *len, int maxLen)
         }
         if(AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_RXRDY)) {
             uint8_t b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+            uart_samples(b);
+            if (uart_frame_done) {
+                *len = uart_len;
+                return TRUE;
+            }
 
-			if(OutOfNDecoding(b & 0x0f)) {
-				*len = Uart.byteCnt;
-				return TRUE;
-			}
         }
     }
 }
@@ -1173,7 +1281,7 @@ int doIClassSimulation( int simulationMode, uint8_t *reader_mac_buf)
 	bool buttonPressed = false;
 	uint8_t response_delay = 1;
 	while(!exitLoop) {
-		response_delay = 1;
+		response_delay = 2;
 		LED_B_OFF();
 		//Signal tracer
 		// Can be used to get a trigger for an oscilloscope..
@@ -1225,7 +1333,7 @@ int doIClassSimulation( int simulationMode, uint8_t *reader_mac_buf)
 				memcpy(data_response, ToSend, ToSendMax);
 				modulated_response = data_response;
 				modulated_response_size = ToSendMax;
-				response_delay = 0;//We need to hurry here...
+				response_delay = 2;//We need to hurry here...
 				//exitLoop = true;
 			}else
 			{	//Not fullsim, we don't respond
@@ -1473,7 +1581,7 @@ void CodeIClassCommand(const uint8_t * cmd, int len)
     for(j = 0; j < 4; j++) {
       for(k = 0; k < 4; k++) {
 			if(k == (b & 3)) {
-				ToSend[++ToSendMax] = 0x0f;
+				ToSend[++ToSendMax] = 0xf0;
 			}
 			else {
 				ToSend[++ToSendMax] = 0x00;
